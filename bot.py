@@ -1,5 +1,6 @@
 import os
 import json
+import asyncio
 import httpx
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -113,27 +114,20 @@ async def groq_ask(prompt):
 
 
 async def get_book_list_json(topic, lang):
-    prompts = {
-        "uz": f"""Sen kitob mutaxassisisan. "{topic}" mavzusida 5 ta haqiqiy mavjud kitob ber.
-FAQAT JSON formatda javob ber, boshqa narsa yozma:
+    desc_lang = {"uz": "O'zbek", "ru": "Russian", "en": "English"}
+    prompt = f"""You are a book expert. Give 5 REAL, famous books about "{topic}".
+Sort by global popularity rating - most popular book MUST be first.
+Use ORIGINAL book titles (do not translate titles).
+Write the "desc" field in {desc_lang[lang]} language.
+Reply ONLY in valid JSON array format, nothing else:
 [
-  {{"title": "Kitob nomi", "author": "Muallif ismi", "desc": "1 qator qisqa tavsif"}},
-  ...
-]""",
-        "ru": f"""Ты эксперт по книгам. Дай 5 реально существующих книг на тему "{topic}".
-Отвечай ТОЛЬКО в формате JSON, ничего больше:
-[
-  {{"title": "Название книги", "author": "Имя автора", "desc": "1 строка краткого описания"}},
-  ...
-]""",
-        "en": f"""You are a book expert. Give 5 real existing books about "{topic}".
-Reply ONLY in JSON format, nothing else:
-[
-  {{"title": "Book title", "author": "Author name", "desc": "1 line brief description"}},
-  ...
+  {{"title": "Original title", "author": "Full author name", "desc": "1 line description in {desc_lang[lang]}"}},
+  {{"title": "Original title", "author": "Full author name", "desc": "1 line description in {desc_lang[lang]}"}},
+  {{"title": "Original title", "author": "Full author name", "desc": "1 line description in {desc_lang[lang]}"}},
+  {{"title": "Original title", "author": "Full author name", "desc": "1 line description in {desc_lang[lang]}"}},
+  {{"title": "Original title", "author": "Full author name", "desc": "1 line description in {desc_lang[lang]}"}}
 ]"""
-    }
-    ans = await groq_ask(prompts[lang])
+    ans = await groq_ask(prompt)
     if not ans:
         return None
     try:
@@ -158,6 +152,16 @@ async def get_book_cover_url(title, author):
     except Exception:
         pass
     return None
+
+
+def build_book_list(uid, books):
+    text = "📚\n\n"
+    buttons = []
+    for i, book in enumerate(books):
+        text += f"*{i+1}. {book['title']}*\n_{book['author']}_\n{book['desc']}\n\n"
+        buttons.append([InlineKeyboardButton(f"📖 {book['title']}", callback_data=f"book_{i}")])
+    buttons.append([InlineKeyboardButton(t(uid, "back"), callback_data="back")])
+    return text, InlineKeyboardMarkup(buttons)
 
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -192,34 +196,24 @@ async def btn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         books = ctx.user_data.get("books", [])
         if idx < len(books):
             book = books[idx]
-            await q.answer(t(uid, "detail_loading"), show_alert=False)
-
-            # Rasm + tezis
             lang = get_lang(uid)
-            tezis_prompt = {
-                "uz": f'"{book["title"]}" ({book["author"]}) kitobi haqida 3-4 ta asosiy tezis yoz. Har biri ✦ belgisi bilan boshlangsin. O\'zbek tilida.',
-                "ru": f'Напиши 3-4 ключевых тезиса о книге "{book["title"]}" ({book["author"]}). Каждый начинается с ✦. На русском.',
-                "en": f'Write 3-4 key theses about the book "{book["title"]}" ({book["author"]}). Each starts with ✦. In English.'
-            }
+            desc_lang = {"uz": "O'zbek", "ru": "Russian", "en": "English"}
+            tezis_prompt = f"""Write 3-4 key theses about the book "{book['title']}" by {book['author']}.
+Each thesis starts with ✦ symbol.
+Write in {desc_lang[lang]} language."""
+
             cover_url, tezis = await asyncio.gather(
                 get_book_cover_url(book["title"], book["author"]),
-                groq_ask(tezis_prompt[lang])
+                groq_ask(tezis_prompt)
             )
 
-            text = f"📖 *{book['title']}*\n👤 _{book['author']}_\n\n{tezis or ''}"
             sites = "• z-lib.id\n• archive.org\n• pdfdrive.com"
-            text += f"\n\n{t(uid, 'download')}\n{sites}"
-
+            text = f"📖 *{book['title']}*\n👤 _{book['author']}_\n\n{tezis or ''}\n\n{t(uid, 'download')}\n{sites}"
             kb = InlineKeyboardMarkup([[InlineKeyboardButton(t(uid, "back"), callback_data="back_books")]])
 
             try:
                 if cover_url:
-                    await q.message.reply_photo(
-                        photo=cover_url,
-                        caption=text,
-                        parse_mode="Markdown",
-                        reply_markup=kb
-                    )
+                    await q.message.reply_photo(photo=cover_url, caption=text, parse_mode="Markdown", reply_markup=kb)
                 else:
                     await q.message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
             except Exception:
@@ -228,18 +222,8 @@ async def btn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif d == "back_books":
         books = ctx.user_data.get("books", [])
         if books:
-            text, kb = build_book_list(uid, books)
-            await q.edit_message_text(text, parse_mode="Markdown", reply_markup=kb)
-
-
-def build_book_list(uid, books):
-    text = "📚\n\n"
-    buttons = []
-    for i, book in enumerate(books):
-        text += f"*{i+1}. {book['title']}*\n_{book['author']}_\n{book['desc']}\n\n"
-        buttons.append([InlineKeyboardButton(f"📖 {book['title']}", callback_data=f"book_{i}")])
-    buttons.append([InlineKeyboardButton(t(uid, "back"), callback_data="back")])
-    return text, InlineKeyboardMarkup(buttons)
+            msg_text, kb = build_book_list(uid, books)
+            await q.edit_message_text(msg_text, parse_mode="Markdown", reply_markup=kb)
 
 
 async def msg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -261,28 +245,22 @@ async def msg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     elif mode == "srch":
         m = await update.message.reply_text(t(uid, "searching"))
-        prompts = {
-            "uz": f""""{text}" kitobini qidir. Agar mavjud bo'lsa:
-To'liq nomi, muallifi, qisqa mazmuni (2-3 gap), janri, yili.
-O'zbek tilida. Agar topilmasa faqat "TOPILMADI" deb yoz.""",
-            "ru": f"""Найди книгу "{text}". Если существует:
-Полное название, автор, краткое содержание (2-3 предложения), жанр, год.
-На русском. Если не найдено, напиши только "НЕ НАЙДЕНО".""",
-            "en": f"""Find the book "{text}". If it exists:
-Full title, author, brief summary (2-3 sentences), genre, year.
-In English. If not found, write only "NOT FOUND"."""
-        }
-        ans = await groq_ask(prompts[lang])
+        desc_lang = {"uz": "O'zbek", "ru": "Russian", "en": "English"}
+        prompt = f"""Find the book "{text}". If it REALLY EXISTS provide:
+- Exact original title
+- Full author name
+- Brief summary (2-3 sentences) in {desc_lang[lang]}
+- Genre
+- Year published
+Write in {desc_lang[lang]} language.
+If not found or unsure, write only: NOT FOUND"""
+        ans = await groq_ask(prompt)
         if ans:
-            not_found = ["TOPILMADI", "НЕ НАЙДЕНО", "NOT FOUND"]
-            if any(w in ans.upper() for w in not_found):
+            if "NOT FOUND" in ans.upper() or "TOPILMADI" in ans.upper():
                 await m.edit_text(t(uid, "not_found"), reply_markup=back_kb(uid))
             else:
                 sites = "• z-lib.id\n• archive.org\n• pdfdrive.com\n• t.me/kitoblar_uz"
-                await m.edit_text(
-                    f"📖\n\n{ans}\n\n{t(uid, 'download')}\n{sites}",
-                    reply_markup=back_kb(uid)
-                )
+                await m.edit_text(f"📖\n\n{ans}\n\n{t(uid, 'download')}\n{sites}", reply_markup=back_kb(uid))
         else:
             await m.edit_text(t(uid, "error"), reply_markup=back_kb(uid))
         ctx.user_data["mode"] = None
@@ -290,8 +268,6 @@ In English. If not found, write only "NOT FOUND"."""
     else:
         await update.message.reply_text(t(uid, "welcome"), reply_markup=main_kb(uid))
 
-
-import asyncio
 
 def main():
     app = ApplicationBuilder().token(TOKEN).build()
