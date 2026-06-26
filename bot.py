@@ -1,4 +1,5 @@
 import os
+import json
 import httpx
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -26,6 +27,8 @@ TEXTS = {
         "back": "🔙 Orqaga",
         "download": "📥 Yuklab olish uchun saytlar:",
         "error": "Xatolik yuz berdi. Qayta urinib ko'ring.",
+        "not_found": "Bu kitob topilmadi. To'g'ri nom yoki muallif ismini kiriting.",
+        "detail_loading": "📖 Ma'lumot yuklanmoqda...",
     },
     "ru": {
         "welcome": "Привет! Я KitobAI — умный книжный бот! 📚\n\nРекомендую книги и помогаю найти электронные версии.",
@@ -40,6 +43,8 @@ TEXTS = {
         "back": "🔙 Назад",
         "download": "📥 Сайты для скачивания:",
         "error": "Произошла ошибка. Попробуйте ещё раз.",
+        "not_found": "Книга не найдена. Введите правильное название или имя автора.",
+        "detail_loading": "📖 Загружаю информацию...",
     },
     "en": {
         "welcome": "Hello! I'm KitobAI — your smart book bot! 📚\n\nI recommend books and help find digital versions.",
@@ -54,6 +59,8 @@ TEXTS = {
         "back": "🔙 Back",
         "download": "📥 Download sites:",
         "error": "An error occurred. Please try again.",
+        "not_found": "Book not found. Please enter correct title or author name.",
+        "detail_loading": "📖 Loading details...",
     }
 }
 
@@ -95,13 +102,62 @@ async def groq_ask(prompt):
                 json={
                     "model": "llama-3.3-70b-versatile",
                     "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 1024
+                    "max_tokens": 1024,
+                    "temperature": 0.3
                 }
             )
             data = r.json()
             return data["choices"][0]["message"]["content"]
-    except Exception as e:
+    except Exception:
         return None
+
+
+async def get_book_list_json(topic, lang):
+    prompts = {
+        "uz": f"""Sen kitob mutaxassisisan. "{topic}" mavzusida 5 ta haqiqiy mavjud kitob ber.
+FAQAT JSON formatda javob ber, boshqa narsa yozma:
+[
+  {{"title": "Kitob nomi", "author": "Muallif ismi", "desc": "1 qator qisqa tavsif"}},
+  ...
+]""",
+        "ru": f"""Ты эксперт по книгам. Дай 5 реально существующих книг на тему "{topic}".
+Отвечай ТОЛЬКО в формате JSON, ничего больше:
+[
+  {{"title": "Название книги", "author": "Имя автора", "desc": "1 строка краткого описания"}},
+  ...
+]""",
+        "en": f"""You are a book expert. Give 5 real existing books about "{topic}".
+Reply ONLY in JSON format, nothing else:
+[
+  {{"title": "Book title", "author": "Author name", "desc": "1 line brief description"}},
+  ...
+]"""
+    }
+    ans = await groq_ask(prompts[lang])
+    if not ans:
+        return None
+    try:
+        start = ans.find('[')
+        end = ans.rfind(']') + 1
+        return json.loads(ans[start:end])
+    except Exception:
+        return None
+
+
+async def get_book_cover_url(title, author):
+    try:
+        query = f"{title} {author}".replace(" ", "+")
+        url = f"https://www.googleapis.com/books/v1/volumes?q={query}&maxResults=1"
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.get(url)
+            data = r.json()
+            items = data.get("items", [])
+            if items:
+                img = items[0].get("volumeInfo", {}).get("imageLinks", {})
+                return img.get("thumbnail") or img.get("smallThumbnail")
+    except Exception:
+        pass
+    return None
 
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -131,6 +187,59 @@ async def btn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif d == "back":
         ctx.user_data["mode"] = None
         await q.edit_message_text(t(uid, "welcome"), reply_markup=main_kb(uid))
+    elif d.startswith("book_"):
+        idx = int(d.split("_")[1])
+        books = ctx.user_data.get("books", [])
+        if idx < len(books):
+            book = books[idx]
+            await q.answer(t(uid, "detail_loading"), show_alert=False)
+
+            # Rasm + tezis
+            lang = get_lang(uid)
+            tezis_prompt = {
+                "uz": f'"{book["title"]}" ({book["author"]}) kitobi haqida 3-4 ta asosiy tezis yoz. Har biri ✦ belgisi bilan boshlangsin. O\'zbek tilida.',
+                "ru": f'Напиши 3-4 ключевых тезиса о книге "{book["title"]}" ({book["author"]}). Каждый начинается с ✦. На русском.',
+                "en": f'Write 3-4 key theses about the book "{book["title"]}" ({book["author"]}). Each starts with ✦. In English.'
+            }
+            cover_url, tezis = await asyncio.gather(
+                get_book_cover_url(book["title"], book["author"]),
+                groq_ask(tezis_prompt[lang])
+            )
+
+            text = f"📖 *{book['title']}*\n👤 _{book['author']}_\n\n{tezis or ''}"
+            sites = "• z-lib.id\n• archive.org\n• pdfdrive.com"
+            text += f"\n\n{t(uid, 'download')}\n{sites}"
+
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton(t(uid, "back"), callback_data="back_books")]])
+
+            try:
+                if cover_url:
+                    await q.message.reply_photo(
+                        photo=cover_url,
+                        caption=text,
+                        parse_mode="Markdown",
+                        reply_markup=kb
+                    )
+                else:
+                    await q.message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
+            except Exception:
+                await q.message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
+
+    elif d == "back_books":
+        books = ctx.user_data.get("books", [])
+        if books:
+            text, kb = build_book_list(uid, books)
+            await q.edit_message_text(text, parse_mode="Markdown", reply_markup=kb)
+
+
+def build_book_list(uid, books):
+    text = "📚\n\n"
+    buttons = []
+    for i, book in enumerate(books):
+        text += f"*{i+1}. {book['title']}*\n_{book['author']}_\n{book['desc']}\n\n"
+        buttons.append([InlineKeyboardButton(f"📖 {book['title']}", callback_data=f"book_{i}")])
+    buttons.append([InlineKeyboardButton(t(uid, "back"), callback_data="back")])
+    return text, InlineKeyboardMarkup(buttons)
 
 
 async def msg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -141,14 +250,11 @@ async def msg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if mode == "rec":
         m = await update.message.reply_text(t(uid, "thinking"))
-        prompts = {
-            "uz": f'"{text}" mavzusida 5 ta eng yaxshi kitob tavsiya qil. Har biri uchun: kitob nomi, muallif, 1-2 qator qisqa tavsif. O\'zbek tilida yoz. Faqat ro\'yxat, boshqa narsa yozma.',
-            "ru": f'Порекомендуй 5 лучших книг на тему "{text}". Для каждой: название, автор, 1-2 строки описания. На русском. Только список.',
-            "en": f'Recommend 5 best books about "{text}". For each: title, author, 1-2 lines description. In English. List only.'
-        }
-        ans = await groq_ask(prompts[lang])
-        if ans:
-            await m.edit_text(f"📚\n\n{ans}", reply_markup=back_kb(uid))
+        books = await get_book_list_json(text, lang)
+        if books:
+            ctx.user_data["books"] = books
+            msg_text, kb = build_book_list(uid, books)
+            await m.edit_text(msg_text, parse_mode="Markdown", reply_markup=kb)
         else:
             await m.edit_text(t(uid, "error"), reply_markup=back_kb(uid))
         ctx.user_data["mode"] = None
@@ -156,14 +262,27 @@ async def msg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif mode == "srch":
         m = await update.message.reply_text(t(uid, "searching"))
         prompts = {
-            "uz": f'"{text}" kitobini top: to\'liq nomi, muallifi, qisqa mazmuni (2-3 gap), janri, yili. O\'zbek tilida.',
-            "ru": f'Найди книгу "{text}": полное название, автор, краткое содержание (2-3 предложения), жанр, год. На русском.',
-            "en": f'Find the book "{text}": full title, author, brief summary (2-3 sentences), genre, year. In English.'
+            "uz": f""""{text}" kitobini qidir. Agar mavjud bo'lsa:
+To'liq nomi, muallifi, qisqa mazmuni (2-3 gap), janri, yili.
+O'zbek tilida. Agar topilmasa faqat "TOPILMADI" deb yoz.""",
+            "ru": f"""Найди книгу "{text}". Если существует:
+Полное название, автор, краткое содержание (2-3 предложения), жанр, год.
+На русском. Если не найдено, напиши только "НЕ НАЙДЕНО".""",
+            "en": f"""Find the book "{text}". If it exists:
+Full title, author, brief summary (2-3 sentences), genre, year.
+In English. If not found, write only "NOT FOUND"."""
         }
         ans = await groq_ask(prompts[lang])
-        sites = "• z-lib.id\n• archive.org\n• pdfdrive.com\n• t.me/kitoblar_uz"
         if ans:
-            await m.edit_text(f"📖\n\n{ans}\n\n{t(uid, 'download')}\n{sites}", reply_markup=back_kb(uid))
+            not_found = ["TOPILMADI", "НЕ НАЙДЕНО", "NOT FOUND"]
+            if any(w in ans.upper() for w in not_found):
+                await m.edit_text(t(uid, "not_found"), reply_markup=back_kb(uid))
+            else:
+                sites = "• z-lib.id\n• archive.org\n• pdfdrive.com\n• t.me/kitoblar_uz"
+                await m.edit_text(
+                    f"📖\n\n{ans}\n\n{t(uid, 'download')}\n{sites}",
+                    reply_markup=back_kb(uid)
+                )
         else:
             await m.edit_text(t(uid, "error"), reply_markup=back_kb(uid))
         ctx.user_data["mode"] = None
@@ -172,12 +291,14 @@ async def msg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(t(uid, "welcome"), reply_markup=main_kb(uid))
 
 
+import asyncio
+
 def main():
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(btn))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, msg))
-    print("✅ KitobAI (Groq) ishga tushdi!")
+    print("✅ KitobAI ishga tushdi!")
     app.run_polling()
 
 
