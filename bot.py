@@ -7,8 +7,8 @@ from telegram.ext import (
 )
 
 TOKEN = os.environ.get("BOT_TOKEN")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 user_lang = {}
 
@@ -25,6 +25,7 @@ TEXTS = {
         "thinking": "🤔 Tavsiyalar tayyorlanmoqda...",
         "back": "🔙 Orqaga",
         "download": "📥 Yuklab olish uchun saytlar:",
+        "error": "Xatolik yuz berdi. Qayta urinib ko'ring.",
     },
     "ru": {
         "welcome": "Привет! Я KitobAI — умный книжный бот! 📚\n\nРекомендую книги и помогаю найти электронные версии.",
@@ -38,6 +39,7 @@ TEXTS = {
         "thinking": "🤔 Готовлю рекомендации...",
         "back": "🔙 Назад",
         "download": "📥 Сайты для скачивания:",
+        "error": "Произошла ошибка. Попробуйте ещё раз.",
     },
     "en": {
         "welcome": "Hello! I'm KitobAI — your smart book bot! 📚\n\nI recommend books and help find digital versions.",
@@ -51,6 +53,7 @@ TEXTS = {
         "thinking": "🤔 Preparing recommendations...",
         "back": "🔙 Back",
         "download": "📥 Download sites:",
+        "error": "An error occurred. Please try again.",
     }
 }
 
@@ -80,17 +83,32 @@ def back_kb(uid):
     return InlineKeyboardMarkup([[InlineKeyboardButton(t(uid, "back"), callback_data="back")]])
 
 
-async def gemini(prompt):
+async def groq_ask(prompt):
     try:
         async with httpx.AsyncClient(timeout=30) as c:
-            r = await c.post(GEMINI_URL, json={"contents": [{"parts": [{"text": prompt}]}]})
-            return r.json()["candidates"][0]["content"]["parts"][0]["text"]
+            r = await c.post(
+                GROQ_URL,
+                headers={
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": "llama-3.3-70b-versatile",
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": 1024
+                }
+            )
+            data = r.json()
+            return data["choices"][0]["message"]["content"]
     except Exception as e:
-        return f"Xatolik: {e}"
+        return None
 
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("📚 KitobAI\n\nTilni tanlang / Выберите язык / Choose language:", reply_markup=lang_kb())
+    await update.message.reply_text(
+        "📚 KitobAI\n\nTilni tanlang / Выберите язык / Choose language:",
+        reply_markup=lang_kb()
+    )
 
 
 async def btn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -124,24 +142,30 @@ async def msg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if mode == "rec":
         m = await update.message.reply_text(t(uid, "thinking"))
         prompts = {
-            "uz": f'"{text}" mavzusida 5 ta eng yaxshi kitob tavsiya qil. Har biri: nom, muallif, 1-2 qator tavsif. O\'zbek tilida.',
-            "ru": f'Порекомендуй 5 лучших книг на тему "{text}". Каждая: название, автор, 1-2 строки. На русском.',
-            "en": f'Recommend 5 best books about "{text}". Each: title, author, 1-2 lines. In English.'
+            "uz": f'"{text}" mavzusida 5 ta eng yaxshi kitob tavsiya qil. Har biri uchun: kitob nomi, muallif, 1-2 qator qisqa tavsif. O\'zbek tilida yoz. Faqat ro\'yxat, boshqa narsa yozma.',
+            "ru": f'Порекомендуй 5 лучших книг на тему "{text}". Для каждой: название, автор, 1-2 строки описания. На русском. Только список.',
+            "en": f'Recommend 5 best books about "{text}". For each: title, author, 1-2 lines description. In English. List only.'
         }
-        ans = await gemini(prompts[lang])
-        await m.edit_text(f"📚\n\n{ans}", reply_markup=back_kb(uid))
+        ans = await groq_ask(prompts[lang])
+        if ans:
+            await m.edit_text(f"📚\n\n{ans}", reply_markup=back_kb(uid))
+        else:
+            await m.edit_text(t(uid, "error"), reply_markup=back_kb(uid))
         ctx.user_data["mode"] = None
 
     elif mode == "srch":
         m = await update.message.reply_text(t(uid, "searching"))
         prompts = {
-            "uz": f'"{text}" kitobini topib ber: to\'liq nomi, muallifi, qisqa mazmuni (2-3 gap), janri, yili. O\'zbek tilida.',
+            "uz": f'"{text}" kitobini top: to\'liq nomi, muallifi, qisqa mazmuni (2-3 gap), janri, yili. O\'zbek tilida.',
             "ru": f'Найди книгу "{text}": полное название, автор, краткое содержание (2-3 предложения), жанр, год. На русском.',
             "en": f'Find the book "{text}": full title, author, brief summary (2-3 sentences), genre, year. In English.'
         }
-        ans = await gemini(prompts[lang])
+        ans = await groq_ask(prompts[lang])
         sites = "• z-lib.id\n• archive.org\n• pdfdrive.com\n• t.me/kitoblar_uz"
-        await m.edit_text(f"📖\n\n{ans}\n\n{t(uid, 'download')}\n{sites}", reply_markup=back_kb(uid))
+        if ans:
+            await m.edit_text(f"📖\n\n{ans}\n\n{t(uid, 'download')}\n{sites}", reply_markup=back_kb(uid))
+        else:
+            await m.edit_text(t(uid, "error"), reply_markup=back_kb(uid))
         ctx.user_data["mode"] = None
 
     else:
@@ -153,7 +177,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(btn))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, msg))
-    print("✅ KitobAI ishga tushdi!")
+    print("✅ KitobAI (Groq) ishga tushdi!")
     app.run_polling()
 
 
